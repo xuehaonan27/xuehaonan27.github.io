@@ -1,0 +1,41 @@
+# Information
+name: XueHaonan
+description: "@MugenCyaegha"
+# png
+# avatar: 
+baseurl: ""          # If repo name is not USERNAME.github.io, need to fill this
+url: "https://xuehaonan27.github.io"  # Your domain
+theme: minima
+footer-links:
+  github: xuehaonan27
+  email: xuehaonan27@gmail.com
+# stackoverflow
+# twitter
+
+# Where things are
+source: .
+destination: ./_site
+layouts_dir         : _layouts
+data_dir            : _data
+includes_dir        : _includes
+sass:
+  sass_dir: _sass
+  style: :expanded
+
+# Handling Reading
+safe: true
+encoding: "utf-8"
+exclude:
+  - .sass-cache/
+  - .jekyll-cache/
+  - gemfiles/
+  - Gemfile
+  - Gemfile.lock
+  - node_modules/
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/
+  - LICENSE
+  - README.md
+  - CNAME
