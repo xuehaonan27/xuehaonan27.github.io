@@ -93,13 +93,12 @@ qemu-img create -f qcow2 WindowsVM.img 64G
 -smp 4 \
 -m 6G \
 -cpu host \
--drive if=virtio,format=qcow2,file=/data/home/testuser/WindowsUEFIVM.img \
+-drive if=virtio,format=qcow2,file=/data/home/testuser/WindowsUEFIVM/WindowsUEFIVM.img \
 -enable-kvm \
 -vnc unix:/data/home/testuser/.cohpc/vms/winuser/vnc.sock \
 -net nic -net user,hostname=windows \
 -drive if=pflash,format=raw,file=/usr/share/edk2/ovmf/OVMF_CODE.fd,readonly=on \
--drive if=pflash,format=raw,file=./WindowsUEFIVM/OVMF_VARS.fd \
--drive if=virtio,format=raw,file=/data/home/testuser/win_seed.iso
+-drive if=pflash,format=raw,file=./WindowsUEFIVM/OVMF_VARS.fd
 ```
 
 cloudbase-init如果在SetUserPasswordPlugin之前用了CreateUserPlugin，那么`BaseCreateUserPlugin._get_password`就会返回一个随机的密码值。
@@ -109,3 +108,22 @@ cloudbase-init如果在SetUserPasswordPlugin之前用了CreateUserPlugin，那�
 
 感觉这是一个cloudbase-init的bug。
 https://github.com/cloudbase/cloudbase-init/issues/165
+
+# 更新：在Windows上安装Virtiofs驱动
+仍然是使用该命令启动Windows并且VNC登录进去。
+```shell
+/data/software/modules/qemu/9.2.0/bin/qemu-system-x86_64 \
+-drive file=./WindowsUEFIVM/WindowsUEFIVM.img,format=qcow2,if=virtio \
+-drive file=SERVER_EVAL_x64FRE_en-us.iso,media=cdrom \
+-drive file=virtio-win.iso,media=cdrom \
+-boot order=d \
+-enable-kvm \
+-cpu host \
+-m 6G \
+-smp 4 \
+-vnc unix:/data/home/testuser/.cohpc/vms/winuser/vnc.sock \
+-drive if=pflash,format=raw,file=/usr/share/edk2/ovmf/OVMF_CODE.fd,readonly=on \
+-drive if=pflash,format=raw,file=./WindowsUEFIVM/OVMF_VARS.fd
+```
+
+安装virtio-win和WinFsp之后，关闭VirtioFsSvc服务，配置多virtiofs实例可，然后用cloudbase-init执行手动挂载。
