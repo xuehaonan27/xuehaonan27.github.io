@@ -127,13 +127,12 @@ https://github.com/virtio-win/kvm-guest-drivers-windows/wiki/Virtiofs:-Shared-fi
 -smp 4 \
 -m 6G \
 -cpu host \
--drive if=virtio,format=qcow2,file=/data/home/testuser/WindowsUEFIVM.img \
+-drive if=virtio,format=qcow2,file=/data/home/testuser/WindowsUEFIVM/WindowsUEFIVM.img \
 -enable-kvm \
 -vnc unix:/data/home/testuser/.cohpc/vms/winuser/vnc.sock \
 -net nic -net user,hostname=windows \
 -drive if=pflash,format=raw,file=/usr/share/edk2/ovmf/OVMF_CODE.fd,readonly=on \
--drive if=pflash,format=raw,file=./WindowsUEFIVM/OVMF_VARS.fd \
--drive if=virtio,format=raw,file=/data/home/testuser/win_seed.iso
+-drive if=pflash,format=raw,file=./WindowsUEFIVM/OVMF_VARS.fd
 ```
 
 以及virtiofs参数。
