@@ -190,6 +190,39 @@ patch -p1 < ../gcc-14.2.0-r2.diff
 make
 sudo make install
 
+```
+
+## binutils
+```shell
+curl -O "https://ftp.gnu.org/gnu/binutils/binutils-with-gold-2.44.tar.gz"
+tar -xf binutils-with-gold-2.44.tar.gz
+cd binutils-with-gold-2.44
+
+CC=/opt/gcc/14.2.0/bin/gcc \
+CXX=/opt/gcc/14.2.0/bin/g++ \
+AR=/opt/gcc/14.2.0/bin/gcc-ar \
+NM=/opt/gcc/14.2.0/bin/gcc-nm \
+./configure \
+    --prefix=/opt/binutils/2.44 \
+    --enable-gold=yes \
+    --enable-ld=yes \
+    --enable-year2038 \
+    --enable-libada \
+    --enable-libgm2 \
+    --enable-libssp \
+    --enable-pgo-build \
+    --enable-lto \
+    --with-zstd=/opt/zstd/1.5.7 \
+    --with-mpc=/opt/mpc/1.3.1 \
+    --with-mpfr=/opt/mpfr/4.2.1 \
+    --with-gmp=/opt/gmp/6.3.0 \
+    --with-isl=/opt/isl/0.24 \
+    --with-gcc-major-version-only \
+    --with-build-sysroot=/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk \
+    --build=aarch64-apple-darwin24
+```
+
+```shell
 # 然后自举
 make clean
 CC=/opt/gcc/14.2.0/bin/gcc \
