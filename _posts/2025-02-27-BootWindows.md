@@ -121,6 +121,8 @@ https://github.com/virtio-win/kvm-guest-drivers-windows/wiki/Virtiofs:-Shared-fi
 "C:\Program Files (x86)\WinFsp\bin\fsreg.bat" virtiofs "<path to the binary>\virtiofs.exe" "-t %1 -m %2"
 ```
 
+https://github.com/winfsp/winfsp/releases/download/v2.1B2/winfsp-2.1.24255.msi
+
 
 ```shell
 /data/software/modules/qemu/9.2.0/bin/qemu-system-x86_64 \
@@ -148,3 +150,30 @@ https://github.com/cloudbase/cloudbase-init/issues/165
 注意，使用Virtiofs，需要配置自动挂载磁盘。在UserData中，例如cloud-config中，配置runcmd一项即可。
 注意SetUserPasswordPlugin一定要在UserDataPlugin之后！
 这些都是cloudbase-init目前的bug。
+
+# 在Aarch64架构上安装
+参考步骤：
+`https://linaro.atlassian.net/wiki/spaces/WOAR/pages/28914909194/windows-arm64+VM+using+qemu-system`
+
+从ISO安装到qcow2的命令
+```shell
+sudo qemu-system-aarch64 \
+-device qemu-xhci -device usb-kbd -device usb-tablet \
+-device usb-storage,drive=install \
+-drive file=./Win11_24H2_English_Arm64.iso,media=cdrom,if=none,id=install \
+-device usb-storage,drive=virtio-drivers \
+-drive file=./virtio-win.iso.1,media=cdrom,if=none,id=virtio-drivers \
+-drive file=./WindowsVMAarch64.qcow2,format=qcow2,if=virtio \
+-device ramfb \
+-boot order=d \
+--accel kvm \
+-machine virt \
+-cpu host \
+-m 8G \
+-smp 8 \
+-vnc 0.0.0.0:1 \
+-bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+-nic user,model=virtio-net-pci
+```
+
+从qcow2启动

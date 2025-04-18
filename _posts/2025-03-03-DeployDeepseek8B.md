@@ -8,6 +8,11 @@ date: 2025-03-03
 ```shell
 export HF_ENDPOINT=https://hf-mirror.com
 huggingface-cli download --resume-download deepseek-ai/DeepSeek-R1-Distill-Llama-8B --local-dir DeepSeek-R1-Distill-Llama-8B
+
+export HF_ENDPOINT=https://hf-mirror.com
+huggingface-cli download --resume-download bartowski/Qwen_QwQ-32B-GGUF Qwen_QwQ-32B-Q8_0.gguf --local-dir Qwen_QwQ-32B-GGUF --local-dir-use-symlinks False
+
+huggingface-cli download --resume-download bartowski/Qwen_QwQ-32B-GGUF Qwen_QwQ-32B-IQ2_XS.gguf --local-dir Qwen_QwQ-32B-GGUF --local-dir-use-symlinks False
 ```
 
 # 运行server
@@ -33,4 +38,18 @@ DEFAULT_MODEL=DeepSeek-R1-Distill-Llama-8B \
 PORT=8081 \
 yarn start
 # PORT=8081 yarn start
+```
+
+# 编译llama.cpp
+```shell
+cmake -B build \
+  -DCMAKE_C_COMPILER=/usr/bin/clang \
+  -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+  -DOpenMP_C_FLAGS="-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include" \
+  -DOpenMP_CXX_FLAGS="-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include" \
+  -DOpenMP_C_LIB_NAMES="omp" \
+  -DOpenMP_CXX_LIB_NAMES="omp" \
+  -DOpenMP_omp_LIBRARY=$(brew --prefix libomp)/lib/libomp.dylib
+
+cmake --build build --config Release -j 8
 ```
