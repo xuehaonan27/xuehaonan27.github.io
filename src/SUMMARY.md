@@ -15,6 +15,8 @@
   - [Intranet Penetration by Tailscale and Clash](./server_maintenance/tailscale_clash_intranet_penetration.md)
   - [Deploy a Deepseek 8B model](./server_maintenance/deploy_deepseek_8b.md)
   - [Try LFS on MacMini M4](./server_maintenance/try_lfs_on_macmini_m4.md)
+- [Managed Runtime](./managed_runtime/README.md)
+  - [Debug G1 load barrier in C2 JIT](./managed_runtime/load-barrier-c2-debug.md)
 - [Miscellaneous](./misc/README.md)
 
 -----------
