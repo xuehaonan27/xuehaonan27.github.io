@@ -36,22 +36,22 @@ __ if_then(obj, BoolTest::ne, kit->null()); {
     Node* lru_sample_counter = __ load(__ ctrl(), lru_sample_counter_adr, TypeX_X, index_bt, Compile::AliasIdxRaw);
     Node* next_counter = kit->gvn().transform(new SubXNode(lru_sample_counter, __ ConX(1)));
 
-    // __ if_then(lru_sample_counter, BoolTest::ne, zeroX, unlikely); {
-    //   __ store(__ ctrl(), lru_sample_counter_adr, next_counter, index_bt, Compile::AliasIdxRaw, MemNode::unordered);
-    // } __ else_(); {
-
-    // }
-    // __ end_if();
-
-    const TypeFunc* tf = load_ref_field_entry_Type();
-    __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::load_ref_field_entry), "load_ref_field_entry", obj, tls);
-
     __ if_then(lru_sample_counter, BoolTest::ne, zeroX, unlikely); {
-    __ store(__ ctrl(), lru_sample_counter_adr, next_counter, index_bt, Compile::AliasIdxRaw, MemNode::unordered);
+      __ store(__ ctrl(), lru_sample_counter_adr, next_counter, index_bt, Compile::AliasIdxRaw, MemNode::unordered);
     } __ else_(); {
 
     }
     __ end_if();
+
+    const TypeFunc* tf = load_ref_field_entry_Type();
+    __ make_leaf_call(tf, CAST_FROM_FN_PTR(address, G1BarrierSetRuntime::load_ref_field_entry), "load_ref_field_entry", obj, tls);
+
+    // __ if_then(lru_sample_counter, BoolTest::ne, zeroX, unlikely); {
+    // __ store(__ ctrl(), lru_sample_counter_adr, next_counter, index_bt, Compile::AliasIdxRaw, MemNode::unordered);
+    // } __ else_(); {
+
+    // }
+    // __ end_if();
 } __ end_if();  // (val != NULL)
 ```
 
