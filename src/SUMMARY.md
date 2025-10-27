@@ -18,6 +18,7 @@
 - [Managed Runtime](./managed_runtime/README.md)
   - [Debug G1 load barrier in C2 JIT](./managed_runtime/load-barrier-c2-debug.md)
 - [Miscellaneous](./misc/README.md)
+  - [Newbee](./misc/newbee.md)
 
 -----------
 
