@@ -93,7 +93,7 @@ struct HasDecorator: public std::integral_constant<bool, (decorators & decorator
 - `struct const DecoratorSet ref_strength_default`: 如果 reference strength 类别中没设置，默认选择 strong。
 - `struct const DecoratorSet memory_ordering_default`: 默认选择 unordered 内存序。
 - `struct const DecoratorSet barrier_strength_default`: 默认选择 normal 的 barrier 强度。
-- `struct const DecoratorSet value = barrier_strength`: 意味不明。
+- `struct const DecoratorSet value = barrier_strength`: 综合了以上三个默认值，是这个元函数的返回值，即默认装饰器集合。
 - `inline DecoratorSet decorator_fixup(DecoratorSet input_decorators, BasicType type)` 是不使用 metaprogramming 和 templates 的方式，即通过运行时函数调用做一样的事情。
 
 ## OOP Access Steps
@@ -116,7 +116,7 @@ struct HasDecorator: public std::integral_constant<bool, (decorators & decorator
 #### Step 5.b
 后运行时派发 (Post-runtime dispatch)。
 
-## access.hpp
+## Basic definitions in access.hpp
 该文件主要定义了：
 ```Cpp
 template <DecoratorSet decorators = DECORATORS_NONE>
@@ -258,7 +258,7 @@ static void verify_primitive_decorators() {
 ```
 额外预置了一些装饰集合。`load` 操作一般不需要 release，而 `store` 操作一般不需要 acquire。对于 `atomic_xchg` 一般必须是最强的 sequential consistent 的，而 `atomic_cmpxchg` 则额外允许了 relaxed 语义。这些都符合一般的原子操作的原则。
 
-## accessBackend.hpp
+## Basic definitions in accessBackend.hpp
 该文件以及关联的 accessBackend.inline.hpp 以及 accessBackend.cpp 实现了 Step 1 - 4。
 
 先回忆一下 accessDecorators.hpp 中定义的 HasDecorator。
@@ -345,91 +345,246 @@ template <DecoratorSet decorators>
 ```
 一个元函数，对于位宽较大的类型，可能硬件不支持单指令原子操作，需要加 lock 然后进行宽原子操作。
 
-### AccessFunctionTypes
+## Access Pipeline
+这一部分具体介绍 Access 的流水线式派发。
+
+### OOP type canonicalization
+```Cpp
+  template <typename T>
+  struct OopOrNarrowOopInternal: AllStatic {
+    typedef oop type;
+  };
+
+  template <>
+  struct OopOrNarrowOopInternal<narrowOop>: AllStatic {
+    typedef narrowOop type;
+  };
+
+  // This metafunction returns a canonicalized oop/narrowOop type for a passed
+  // in oop-like types passed in from oop_* overloads where the user has sworn
+  // that the passed in values should be oop-like (e.g. oop, oopDesc*, arrayOop,
+  // narrowOoop, instanceOopDesc*, and random other things).
+  // In the oop_* overloads, it must hold that if the passed in type T is not
+  // narrowOop, then it by contract has to be one of many oop-like types implicitly
+  // convertible to oop, and hence returns oop as the canonical oop type.
+  // If it turns out it was not, then the implicit conversion to oop will fail
+  // to compile, as desired.
+  template <typename T>
+  struct OopOrNarrowOop: AllStatic {
+    typedef typename OopOrNarrowOopInternal<std::decay_t<T>>::type type;
+  };
+```
+
+`OopOrNarrowOop` 做了类型规范化。
+- 如果传入的 `T` 类型是 `narrowOop`，那没什么好说还是 `narrowOop`（直接匹配`OopOrNarrowOopInternal<narrowOop>`）。
+- 如果传入的 `T` 类型是 `oop` 或者可以隐式转换为 `oop` 的类型（例如 `oopDesc*`，`arrayOop`，`instanceOopDesc*`）则会规范化到 `oop`（匹配`OopOrNarrowOopInternal<narrowOop>`失败，去匹配更弱一级的`template <typename T> OopOrNarrowOopInternal`，就会都变成 `oop` 类型）。
+- 如果传入的 `T` 对上述两个都匹配失败，那么说明根本不是一个对象指针传进来了，应该 Error，编译失败，符合预期。
+
+### Step 1
+完成如下几件事情：
+1. 类型检查。
+2. 类型衰减（decay type），去除 const 和 volatile 关键字。
+3. 补全装饰器，对未设置装饰器值的类别补上一个默认值（上文已述）。如果是 volatile 的那么默认内存序不是 unordered 而是 relaxed。
+
+这一步仍然是用 `load` 操作来举例子。
+```Cpp
+  template <DecoratorSet decorators, typename P, typename T>
+  inline T load(P* addr) {
+    verify_types<decorators, T>();
+    using DecayedP = std::decay_t<P>;
+    using DecayedT = std::conditional_t<HasDecorator<decorators, INTERNAL_VALUE_IS_OOP>::value,
+                                        typename OopOrNarrowOop<T>::type,
+                                        std::decay_t<T>>;
+    // If a volatile address is passed in but no memory ordering decorator,
+    // set the memory ordering to MO_RELAXED by default.
+    const DecoratorSet expanded_decorators = DecoratorFixup<
+      (std::is_volatile<P>::value && !HasDecorator<decorators, MO_DECORATOR_MASK>::value) ?
+      (MO_RELAXED | decorators) : decorators>::value;
+    return load_reduce_types<expanded_decorators, DecayedT>(const_cast<DecayedP*>(addr));
+  }
+```
+
+#### Verify types
 ```Cpp
   template <DecoratorSet decorators, typename T>
-  struct AccessFunctionTypes {
-    typedef T (*load_at_func_t)(oop base, ptrdiff_t offset);
-    typedef void (*store_at_func_t)(oop base, ptrdiff_t offset, T value);
-    typedef T (*atomic_cmpxchg_at_func_t)(oop base, ptrdiff_t offset, T compare_value, T new_value);
-    typedef T (*atomic_xchg_at_func_t)(oop base, ptrdiff_t offset, T new_value);
-
-    typedef T (*load_func_t)(void* addr);
-    typedef void (*store_func_t)(void* addr, T value);
-    typedef T (*atomic_cmpxchg_func_t)(void* addr, T compare_value, T new_value);
-    typedef T (*atomic_xchg_func_t)(void* addr, T new_value);
-
-    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, T* src_raw,
-                                     arrayOop dst_obj, size_t dst_offset_in_bytes, T* dst_raw,
-                                     size_t length);
-    typedef void (*clone_func_t)(oop src, oop dst, size_t size);
-  };
-
-  template <DecoratorSet decorators>
-  struct AccessFunctionTypes<decorators, void> {
-    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, void* src,
-                                     arrayOop dst_obj, size_t dst_offset_in_bytes, void* dst,
-                                     size_t length);
-  };
-
-  template <DecoratorSet decorators>
-  struct AccessFunctionTypes<decorators, void> {
-    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, void* src,
-                                     arrayOop dst_obj, size_t dst_offset_in_bytes, void* dst,
-                                     size_t length);
-  };
-```
-这个类定义了各个 OOP operation 对应的函数类型。其中类的元参数中 `DecoratorSet decorators` 是本次访问的装饰器集合，`typename T` 是 OOP operation 的返回类型。
-
-### AccessFunction
-```Cpp
-  template <DecoratorSet decorators, typename T, BarrierType barrier> struct AccessFunction {};
-
-#define ACCESS_GENERATE_ACCESS_FUNCTION(bt, func)                   \
-  template <DecoratorSet decorators, typename T>                    \
-  struct AccessFunction<decorators, T, bt>: AllStatic{              \
-    typedef typename AccessFunctionTypes<decorators, T>::func type; \
+  static void verify_types(){
+    // If this fails to compile, then you have sent in something that is
+    // not recognized as a valid primitive type to a primitive Access function.
+    STATIC_ASSERT((HasDecorator<decorators, INTERNAL_VALUE_IS_OOP>::value || // oops have already been validated
+                   (std::is_pointer<T>::value || std::is_integral<T>::value) ||
+                    std::is_floating_point<T>::value)); // not allowed primitive type
   }
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_STORE, store_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_STORE_AT, store_at_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_LOAD, load_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_LOAD_AT, load_at_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_CMPXCHG, atomic_cmpxchg_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_CMPXCHG_AT, atomic_cmpxchg_at_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_XCHG, atomic_xchg_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_XCHG_AT, atomic_xchg_at_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ARRAYCOPY, arraycopy_func_t);
-  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_CLONE, clone_func_t);
-#undef ACCESS_GENERATE_ACCESS_FUNCTION
+```
+所有流水线派发的第一步都会调用这个 `verify_types`。它会静态检查类型：
+1. 是 OOP
+2. 是 pointer
+3. 是 integral
+4. 是 floating point
+除此之外的类型都不允许。
 
-  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
-  typename AccessFunction<decorators, T, barrier_type>::type resolve_barrier();
+#### Decay type
+```Cpp
+    using DecayedP = std::decay_t<P>;
+    using DecayedT = std::conditional_t<HasDecorator<decorators, INTERNAL_VALUE_IS_OOP>::value,
+                                        typename OopOrNarrowOop<T>::type,
+                                        std::decay_t<T>>;
+```
+在上面 load 的代码中可以看到，这里静态地利用了 `std::decay_t` 做了类型衰减，将指针 P 类型衰减为 DecayedP，将返回值类型 T 衰减为 DecayedT。其中 T 会进行一次特判，即如果是 OOP 类型的话，会利用前文所述的 `OopOrNarrowOop` 规范化为 `oop` 或者 `narrowOop`；如果是基本类型，那么就是用 `std::decay_t` 去除 CV 限定符（其实 std::decay_t 所做的不仅仅是这些，它会综合处理所有按值传递相关的转换，但是由于之前已经经过了类型检查，所以针对通过检查的类型基本能做的就是 CV 限定符去除了）。
 
-  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
-  typename AccessFunction<decorators, T, barrier_type>::type resolve_oop_barrier();
+#### Decorators fixup
+这一步补全装饰器集合。
+```Cpp
+    // If a volatile address is passed in but no memory ordering decorator,
+    // set the memory ordering to MO_RELAXED by default.
+    const DecoratorSet expanded_decorators = DecoratorFixup<
+      (std::is_volatile<P>::value && !HasDecorator<decorators, MO_DECORATOR_MASK>::value) ?
+      (MO_RELAXED | decorators) : decorators>::value;
+```
+`DecoratorFixup` 之前已经介绍过，它作为一个元函数，会将传入的装饰器集合补全（将没设置的类别补上一个默认值），并用 `value` 返回出来。那么现在看一下传入的装饰器集合：
+```Cpp
+(std::is_volatile<P>::value && !HasDecorator<decorators, MO_DECORATOR_MASK>::value) ?
+      (MO_RELAXED | decorators) : decorators
+```
+- 如果目前内存序类别中已经有装饰器了，那么就直接原样传入即可。
+- 如果内存序类别中没有装饰器而且指针类型 P 是带着 volatile 关键字的，那么设置一个 `MO_RELAXED` 进去，这样 `DecoratorFixup` 就只会修复别的类别了。
+- 如果内存序类别中没有配置装饰器而且指针类型 P 不是 volatile 的，那么还是原样传入，让 `DecoratorFixup` 加上默认的 `MO_UNORDERED`。
+
+#### Invoke implementation
+在类型检查和规范化都完成之后，就进入了流水线的下一步。
+```Cpp
+return load_reduce_types<expanded_decorators, DecayedT>(const_cast<DecayedP*>(addr));
+```
+带着修复好的装饰器集合以及通过类型检查、类型衰减和规范化的 DecayedT 和 DecayedP，进入 Step 2。
+
+### Step 2: Reduce types
+这一步检查 P 和 T 的类型，保证 P 和 T 是匹配的，即 P 是对应类型的指针类型，而 T 是对应类型的值类型。将错误的类型利用 SFINAE 报编译错误，并且将基本类型和 OOP 类型利用 SFINAE 分流，分开匹配。可以看一下这部分的注释。
+```Cpp
+` // Step 2: Reduce types.
+  // Enforce that for non-oop types, T and P have to be strictly the same.
+  // P is the type of the address and T is the type of the values.
+  // As for oop types, it is allow to send T in {narrowOop, oop} and
+  // P in {narrowOop, oop, HeapWord*}. The following rules apply according to
+  // the subsequent table. (columns are P, rows are T)
+  // |           | HeapWord  |   oop   | narrowOop |
+  // |   oop     |  rt-comp  | hw-none |  hw-comp  |
+  // | narrowOop |     x     |    x    |  hw-none  |
+  //
+  // x means not allowed
+  // rt-comp means it must be checked at runtime whether the oop is compressed.
+  // hw-none means it is statically known the oop will not be compressed.
+  // hw-comp means it is statically known the oop will be compressed.
 ```
 
-针对每一个 OOP operation 的函数类型，都声明一个 `template <DecoratorSet decorators, typename T> struct AccessFunction<decorators, T, bt>`。这个 `AccessFunction` 作为元函数主要是返回里存储的 `typename AccessFunctionTypes<decorators, T>::func type`， 即根据 barrier type 就能推导对应哪一个 access function type（OOP operatio 的函数签名）。
+注意到 `P = pointer to HeapWord*` `T = oop` 的情况下需要运行时检查 `P` 这个地方存的是什么，如果是 oop 还好直接返回；如果是 `narrowOop` 就需要一步转换。而 `P = pointer to oop` `T = narrowOop` 是不允许的，这样会用位宽大的指针加载位宽小的值；同理 `P = pointer to HeapWord*` `T = narrowOop` 也不允许，因为 P 指的地方有可能真是一个 `oop`，这样也有可能位宽大的指针加载位宽小的值。
+
+还是以 `load` 举例。
+```Cpp
+  template <DecoratorSet decorators, typename T>
+  inline T load_reduce_types(T* addr) {
+    return PreRuntimeDispatch::load<decorators, T>(addr);
+  }
+
+  template <DecoratorSet decorators, typename T>
+  inline typename OopOrNarrowOop<T>::type load_reduce_types(narrowOop* addr) {
+    const DecoratorSet expanded_decorators = decorators | INTERNAL_CONVERT_COMPRESSED_OOP |
+                                             INTERNAL_RT_USE_COMPRESSED_OOPS;
+    return PreRuntimeDispatch::load<expanded_decorators, typename OopOrNarrowOop<T>::type>(addr);
+  }
+
+  template <DecoratorSet decorators, typename T>
+  inline oop load_reduce_types(HeapWord* addr) {
+    const DecoratorSet expanded_decorators = decorators | INTERNAL_CONVERT_COMPRESSED_OOP;
+    return PreRuntimeDispatch::load<expanded_decorators, oop>(addr);
+  }
+```
+三个 `load_reduce_types`，分别匹配：
+- 第一个，指针和值类型一样，匹配 `narrowOop* narrowOop` 和 `oop* oop` 的情况。不需要增加任何的装饰器。
+- 第二个，指针是 `narrowOop*` 的，那么值就有可能是 `narrowOop` 或者 `oop` 的，通过 `OopOrNarrowOop` 根据装饰器集合判断。并且添加 `INTERNAL_CONVERT_COMPRESSED_OOP` 和 `INTERNAL_RT_USE_COMPRESSED_OOPS` 两个装饰器，需要进行一下解压缩。
+- 第三个，指针是 `HeapWord*` 的，那么值就只能是 `oop`。添加 `INTERNAL_CONVERT_COMPRESSED_OOP` 这个装饰器。
+
+在经过 Step 2 的 Reduce types 之后，会进入 Step 3 的预运行时分发。
+
+### Step 3: Pre-runtime dispatch
+预运行时分发阶段根据 barrier strength decorators，过滤掉 Raw Access，将它们直接生成代码，而不再继续向下走流水线，并且让 `RawAccessBarrier` 处理压缩指针和内存序装饰器；对于其他类型的访问，则继续经过运行时检查。
 
 ```Cpp
-  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
-  typename AccessFunction<decorators, T, barrier_type>::type resolve_barrier();
+  struct PreRuntimeDispatch: AllStatic {
+    template<DecoratorSet decorators>
+    struct CanHardwireRaw: public std::integral_constant<
+      bool,
+      !HasDecorator<decorators, INTERNAL_VALUE_IS_OOP>::value || // primitive access
+      !HasDecorator<decorators, INTERNAL_CONVERT_COMPRESSED_OOP>::value || // don't care about compressed oops (oop* address)
+      HasDecorator<decorators, INTERNAL_RT_USE_COMPRESSED_OOPS>::value> // we can infer we use compressed oops (narrowOop* address)
+    {};
 
-  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
-  typename AccessFunction<decorators, T, barrier_type>::type resolve_oop_barrier();
+    static const DecoratorSet convert_compressed_oops = INTERNAL_RT_USE_COMPRESSED_OOPS | INTERNAL_CONVERT_COMPRESSED_OOP;
+
+    template<DecoratorSet decorators>
+    static bool is_hardwired_primitive() {
+      return !HasDecorator<decorators, INTERNAL_VALUE_IS_OOP>::value;
+    }
 ```
-所以这两个函数 `resolve_barrier` 和 `resolve_oop_barrier` 都是这样的，根据传入的装饰器集合、访问的值类型 T 以及对应屏障类型，解析出来应该使用的访问函数的函数签名（函数类型）是怎样的。
 
-### AccessLocker
+首先 `CanHardwireRaw` 是一个元布尔值，为 true 时：
+1. 装饰器表明这是一个基本类型访问。
+2. 该访问是 OOP 访问，但是不需要关心 OOP 指针压缩问题。
+3. 该访问是 OOP 访问，而且需要 Runtime 进行指针压缩解压缩操作。
+
+如果 `CanHardwireRaw` 是真值，
+
+还是以 load 操作举例。
+
 ```Cpp
-  class AccessLocker {
-  public:
-    AccessLocker();
-    ~AccessLocker();
-  };
-  bool wide_atomic_needs_locking();
+    template <DecoratorSet decorators, typename T>
+    inline static typename EnableIf<
+      HasDecorator<decorators, AS_RAW>::value && CanHardwireRaw<decorators>::value, T>::type
+    load(void* addr) {
+      typedef RawAccessBarrier<decorators & RAW_DECORATOR_MASK> Raw;
+      if (HasDecorator<decorators, INTERNAL_VALUE_IS_OOP>::value) {
+        return Raw::template oop_load<T>(addr);
+      } else {
+        return Raw::template load<T>(addr);
+      }
+    }
 ```
-为位宽较大的类型模拟原子操作。
+匹配到这个 load 的，说明：
+1. 本次 Access 是 `AS_RAW` 的。
+2. 本次 Access 可以直接转化为硬编码。
+
+那么再根据是 OOP 访问还是基本类型访问，调用 `RawAccessBarrier` 中的 `oop_load` 或者 `load` 即可，`RawAccessBarrier` 会继续处理，直接生成 C++ 代码，并由编译器编为二进制。
+
+```Cpp
+    template <DecoratorSet decorators, typename T>
+    inline static typename EnableIf<
+      HasDecorator<decorators, AS_RAW>::value && !CanHardwireRaw<decorators>::value, T>::type
+    load(void* addr) {
+      if (UseCompressedOops) {
+        const DecoratorSet expanded_decorators = decorators | convert_compressed_oops;
+        return PreRuntimeDispatch::load<expanded_decorators, T>(addr);
+      } else {
+        const DecoratorSet expanded_decorators = decorators & ~convert_compressed_oops;
+        return PreRuntimeDispatch::load<expanded_decorators, T>(addr);
+      }
+    }
+```
+而对于无法直接特化为 C++ 代码的 Raw access，应该是在 `CanHardwireRaw` 中出了问题，这里会根据 OOP 访问还是基本类型访问，补全或者去除掉 `INTERNAL_RT_USE_COMPRESSED_OOPS` 和 `INTERNAL_CONVERT_COMPRESSED_OOP;` 这两个装饰器，然后再一次尝试匹配，这次匹配到第一个 load。
+
+```Cpp
+    template <DecoratorSet decorators, typename T>
+    inline static typename EnableIf<
+      !HasDecorator<decorators, AS_RAW>::value, T>::type
+    load(void* addr) {
+      if (is_hardwired_primitive<decorators>()) {
+        const DecoratorSet expanded_decorators = decorators | AS_RAW;
+        return PreRuntimeDispatch::load<expanded_decorators, T>(addr);
+      } else {
+        return RuntimeDispatch<decorators, T, BARRIER_LOAD>::load(addr);
+      }
+    }
+```
+而对于不是 Raw Access 的访问来说，会匹配到这个 load 上来。
+- 对于基本类型的访问来说，即使是 `AS_NORMAL` 或别的什么访问类型，也可以被当做 Raw Access 直接生成 C++ 代码了，因为没啥区别，所以加上 `AS_RAW` 装饰器并再次匹配，这次匹配就应该匹配到第一个 load 并直接特化为 C++ 代码了。
+- 对于非 Raw Access 的 OOP access 来说，就无法在静态确定如何生成 C++ 代码了，就需要进入 Runtime，并且根据 OOP operation 类型附加上一个 barrier 类型，比如 load 就是 `BARRIER_LOAD`。
 
 ### RawAccessBarrier
 这个类比较大，主要是执行 Raw Access 用的，里面的方法用于 Raw Access 派发。
@@ -605,6 +760,264 @@ inline T RawAccessBarrier<decorators>::oop_load(void* addr) {
 ```
 首先通过 `EncodedType` 推导出本次 OOP access 的 OOP 类型是怎样的，即确定是 narrowOop 还是 oop。然后通过 `load` 操作从地址 `addr` 中原子地将这个 oop 指针（或者 32bit narrowOop 指针）拿出来，最后通过 `decode` 调用 `CompressedOops` 解码（如果 `Encoded` 是 `oop` 那么原样返回，如果是 `narrowOop` 那么经过一些计算得到 `oop`），最终返回出 `T` 这个类型（实际上就应该是 `oop` 类型）。
 
-### Access Pipeline
-这一部分具体介绍 Access 的流水线式派发。
+### Step 4: Runtime dispatch
+进入流水线这一步的，应该就是 非 Raw Access 且是 OOP Access 的。由于运行时分发需要在 JVM 实际跑起来之后才能知道使用的是什么 GC，以及别的一些运行时信息，所以需要附加的 barrier 在静态是不确定的，所以最开始这个 barrier pointer 会指向一个初始化函数（accessor resolution funciton），在首次调用时会解析到具体的函数并存储，在之后就直接访问它就行了，有点类似于动态链接库里面用于延迟绑定的 GOT / PLT。
 
+先看 Access Functions 的定义。
+#### AccessFunctionTypes
+```Cpp
+  template <DecoratorSet decorators, typename T>
+  struct AccessFunctionTypes {
+    typedef T (*load_at_func_t)(oop base, ptrdiff_t offset);
+    typedef void (*store_at_func_t)(oop base, ptrdiff_t offset, T value);
+    typedef T (*atomic_cmpxchg_at_func_t)(oop base, ptrdiff_t offset, T compare_value, T new_value);
+    typedef T (*atomic_xchg_at_func_t)(oop base, ptrdiff_t offset, T new_value);
+
+    typedef T (*load_func_t)(void* addr);
+    typedef void (*store_func_t)(void* addr, T value);
+    typedef T (*atomic_cmpxchg_func_t)(void* addr, T compare_value, T new_value);
+    typedef T (*atomic_xchg_func_t)(void* addr, T new_value);
+
+    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, T* src_raw,
+                                     arrayOop dst_obj, size_t dst_offset_in_bytes, T* dst_raw,
+                                     size_t length);
+    typedef void (*clone_func_t)(oop src, oop dst, size_t size);
+  };
+
+  template <DecoratorSet decorators>
+  struct AccessFunctionTypes<decorators, void> {
+    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, void* src,
+                                     arrayOop dst_obj, size_t dst_offset_in_bytes, void* dst,
+                                     size_t length);
+  };
+
+  template <DecoratorSet decorators>
+  struct AccessFunctionTypes<decorators, void> {
+    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, void* src,
+                                     arrayOop dst_obj, size_t dst_offset_in_bytes, void* dst,
+                                     size_t length);
+  };
+```
+这个类定义了各个 OOP operation 对应的函数类型。其中类的元参数中 `DecoratorSet decorators` 是本次访问的装饰器集合，`typename T` 是 OOP operation 的返回类型。
+
+#### AccessFunction
+```Cpp
+  template <DecoratorSet decorators, typename T, BarrierType barrier> struct AccessFunction {};
+
+#define ACCESS_GENERATE_ACCESS_FUNCTION(bt, func)                   \
+  template <DecoratorSet decorators, typename T>                    \
+  struct AccessFunction<decorators, T, bt>: AllStatic{              \
+    typedef typename AccessFunctionTypes<decorators, T>::func type; \
+  }
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_STORE, store_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_STORE_AT, store_at_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_LOAD, load_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_LOAD_AT, load_at_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_CMPXCHG, atomic_cmpxchg_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_CMPXCHG_AT, atomic_cmpxchg_at_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_XCHG, atomic_xchg_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_XCHG_AT, atomic_xchg_at_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ARRAYCOPY, arraycopy_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_CLONE, clone_func_t);
+#undef ACCESS_GENERATE_ACCESS_FUNCTION
+
+  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
+  typename AccessFunction<decorators, T, barrier_type>::type resolve_barrier();
+
+  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
+  typename AccessFunction<decorators, T, barrier_type>::type resolve_oop_barrier();
+```
+
+针对每一个 OOP operation 的函数类型，都声明一个 `template <DecoratorSet decorators, typename T> struct AccessFunction<decorators, T, bt>`。这个 `AccessFunction` 作为元函数主要是返回里存储的 `typename AccessFunctionTypes<decorators, T>::func type`， 即根据 barrier type 就能推导对应哪一个 access function type（OOP operatio 的函数签名）。
+
+```Cpp
+  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
+  typename AccessFunction<decorators, T, barrier_type>::type resolve_barrier();
+
+  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
+  typename AccessFunction<decorators, T, barrier_type>::type resolve_oop_barrier();
+```
+所以这两个函数 `resolve_barrier` 和 `resolve_oop_barrier` 都是这样的，根据传入的装饰器集合、访问的值类型 T 以及对应屏障类型，解析出来应该使用的访问函数的函数签名（函数类型）是怎样的。
+
+#### AccessLocker
+```Cpp
+  class AccessLocker {
+  public:
+    AccessLocker();
+    ~AccessLocker();
+  };
+  bool wide_atomic_needs_locking();
+```
+为位宽较大的类型模拟原子操作。
+
+#### load 举例说明
+```Cpp
+  template <DecoratorSet decorators, typename T, BarrierType type>
+  struct RuntimeDispatch: AllStatic {};
+```
+
+Runtime dispatch 有一个通用的 `RuntimeDispatch` 类，但是针对每一种 OOP operation 都会各自偏特化一个 `RuntimeDispatch` 出来，比如 load 的就是：
+
+```Cpp
+  template <DecoratorSet decorators, typename T>
+  struct RuntimeDispatch<decorators, T, BARRIER_LOAD>: AllStatic {
+    typedef typename AccessFunction<decorators, T, BARRIER_LOAD>::type func_t;
+    static func_t _load_func;
+
+    static T load_init(void* addr);
+
+    static inline T load(void* addr) {
+      assert_access_thread_state();
+      return _load_func(addr);
+    }
+  };
+```
+
+只有设置了 `BARRIER_LOAD` 的才会偏特化到这个定义上面，即对应 load 操作。在调用 `load` 时，会委派给 `_load_func` 即类里面存储的 `static func_t _load_func`，这个 `func_t` 函数类型是静态就能够确定好的，就是 `typedef T (*load_func_t)(void* addr);`。这个 `_load_func` 在初始状态下是这样的：
+```Cpp
+  template <DecoratorSet decorators, typename T>
+  typename AccessFunction<decorators, T, BARRIER_LOAD>::type
+  RuntimeDispatch<decorators, T, BARRIER_LOAD>::_load_func = &load_init;
+```
+
+即指向了本类中定义的 `load_init` 函数。这个函数，以及别的 OOP operation 对应的 `store_init`，`atomic_cmpxchg_init` 等等初始化函数的签名都是没有实际意义的，仅仅是为了和各自的 `func_t` 保持一致以便静态存储在 `_load_func` 等里面。它们在内部做的事情都是一样的，以 load_init 为例：
+```Cpp
+  template <DecoratorSet decorators, typename T>
+  T RuntimeDispatch<decorators, T, BARRIER_LOAD>::load_init(void* addr) {
+    func_t function = BarrierResolver<decorators, func_t, BARRIER_LOAD>::resolve_barrier();
+    _load_func = function;
+    return function(addr);
+  }
+```
+它会调用 `BarrierResolver` 的函数根据运行时信息来解析出具体是哪一个实际的 OOP operation 函数要使用，并且存储到 `_load_func` 中，并在初次调用中直接调用一次；后续调用就会直接走 `function` 了，`BarrierResolver::resolve_barrier` 对每一种 OOP operation 只会执行一次。
+
+### Step 5.a Barrier resolution
+```Cpp
+  // Resolving accessors with barriers from the barrier set happens in two steps.
+  // 1. Expand paths with runtime-decorators, e.g. is UseCompressedOops on or off.
+  // 2. Expand paths for each BarrierSet available in the system.
+  template <DecoratorSet decorators, typename FunctionPointerT, BarrierType barrier_type>
+  struct BarrierResolver: public AllStatic
+```
+根据注释可以知道，Barrier resolution 分两步走。
+1. 展开装饰器（取决于是否采用了 UseCompressedOops）。
+2. 根据 GC 算法选择。
+
+#### Expand decorator set
+```Cpp
+    static FunctionPointerT resolve_barrier_rt() {
+      if (UseCompressedOops) {
+        const DecoratorSet expanded_decorators = decorators | INTERNAL_RT_USE_COMPRESSED_OOPS;
+        return resolve_barrier_gc<expanded_decorators>();
+      } else {
+        return resolve_barrier_gc<decorators>();
+      }
+    }
+
+    static FunctionPointerT resolve_barrier() {
+      return resolve_barrier_rt();
+    }
+```
+在 Step 4 末尾介绍的调用 `resolve_barrier` 实际上会直接调用 `resolve_barrier_rt`。在这里首先根据是否启用了 UseCompressedOops 将装饰器集合添加 `INTERNAL_RT_USE_COMPRESSED_OOPS`。并且调用 `resolve_barrier_gc`。
+
+`resolve_barrier_gc` 根据 `HasDecorator<ds, INTERNAL_VALUE_IS_OOP>` 进行 SFINAE，即根据是否是 OOP 访问派发到不同的函数上。
+
+对于 INTERNAL_VALUE_IS_OOP 的：
+```Cpp
+    template <DecoratorSet ds>
+    static typename EnableIf<
+      HasDecorator<ds, INTERNAL_VALUE_IS_OOP>::value,
+      FunctionPointerT>::type
+    resolve_barrier_gc() {
+      BarrierSet* bs = BarrierSet::barrier_set();
+      assert(bs != nullptr, "GC barriers invoked before BarrierSet is set");
+      switch (bs->kind()) {
+#define BARRIER_SET_RESOLVE_BARRIER_CLOSURE(bs_name)                    \
+        case BarrierSet::bs_name: {                                     \
+          return PostRuntimeDispatch<typename BarrierSet::GetType<BarrierSet::bs_name>::type:: \
+            AccessBarrier<ds>, barrier_type, ds>::oop_access_barrier; \
+        }                                                               \
+        break;
+        FOR_EACH_CONCRETE_BARRIER_SET_DO(BARRIER_SET_RESOLVE_BARRIER_CLOSURE)
+#undef BARRIER_SET_RESOLVE_BARRIER_CLOSURE
+
+      default:
+        fatal("BarrierSet AccessBarrier resolving not implemented");
+        return nullptr;
+      };
+    }
+```
+从 `BarrierSet` 中根据对应 GC 算法取出合适的 GC 屏障集。并且对应 GC 算法进入 Post-runtime dispatch 返回真正的 OOP operation 函数。
+
+而对于不是 INTERNAL_VALUE_IS_OOP 的，仅仅是将 `oop_access_barrier` 换成 `access_barrier`，其他地方没有区别。
+
+然后现在先来看一下这堆宏是什么。完整的 context 如下。
+```Cpp
+// Do something for each concrete barrier set part of the build.
+#define FOR_EACH_CONCRETE_BARRIER_SET_DO(f)          \
+  f(CardTableBarrierSet)                             \
+  EPSILONGC_ONLY(f(EpsilonBarrierSet))               \
+  G1GC_ONLY(f(G1BarrierSet))                         \
+  SHENANDOAHGC_ONLY(f(ShenandoahBarrierSet))         \
+  ZGC_ONLY(f(XBarrierSet))                           \
+  ZGC_ONLY(f(ZBarrierSet))
+
+#define BARRIER_SET_RESOLVE_BARRIER_CLOSURE(bs_name)                    \
+        case BarrierSet::bs_name: {                                     \
+          return PostRuntimeDispatch<typename BarrierSet::GetType<BarrierSet::bs_name>::type:: \
+            AccessBarrier<ds>, barrier_type, ds>::oop_access_barrier; \
+        }                                                               \
+        break;
+        FOR_EACH_CONCRETE_BARRIER_SET_DO(BARRIER_SET_RESOLVE_BARRIER_CLOSURE)
+#undef BARRIER_SET_RESOLVE_BARRIER_CLOSURE
+```
+很显然使用了 X-macro 技巧。诸如 `G1GC_ONLY` 这种是编译开关，是在构建JDK 的时候指定的。而对于打开编译开关的 GC 算法，比如我们打开了 `G1GC_ONLY` 在构建这个 JDK 时包括了 G1 GC 算法，那么这段宏就会将 `G1BarrierSet` 作为 bs_name 宏参数传递给 `BARRIER_SET_RESOLVE_BARRIER_CLOSURE`。那么宏展开为：
+```Cpp
+case BarrierSet::G1BarrierSet: {
+  return PostRuntimeDispatch<typename BarrierSet::GetType<BarrierSet::G1BarrierSet>::type::
+            AccessBarrier<ds>, barrier_type, ds>::oop_access_barrier;
+}
+break;
+```
+整段就是生成一堆 switch 语句而已。会根据拿到的 BarrierSet 类型做 Fake RTTI，然后做 Post-runtime dispatch。
+
+### Step 5.b Post-runtime dispatch
+在最终调用 `BarrierSet::AccessBarrier` 前还是要过一层这个 `PostRuntimeDispatch` 的。看注释更清楚：
+```Cpp
+  // Step 5.b: Post-runtime dispatch.
+  // This class is the last step before calling the BarrierSet::AccessBarrier.
+  // Here we make sure to figure out types that were not known prior to the
+  // runtime dispatch, such as whether an oop on the heap is oop or narrowOop.
+  // We also split orthogonal barriers such as handling primitives vs oops
+  // and on-heap vs off-heap into different calls to the barrier set.
+  template <class GCBarrierType, BarrierType type, DecoratorSet decorators>
+  struct PostRuntimeDispatch: public AllStatic { };
+```
+这一步会在运行时弄清楚在静态不清楚的信息，比如说之前提到的 P 类型是 `HeapWord*` 的时候到底加载的对象指针是 `oop` 还是 `narrowOop`。以及会使用到 `ON_` 开头的那些访问位置装饰器。
+
+`PostRuntimeDispatch` 这个类的定义方式和 `RuntimeDispatch` 很像，都是有一个空实现的模板类，然后根据每一种 OOP operation 偏特化出一个类。
+
+还是以 load 操作举例。
+```Cpp
+  template <class GCBarrierType, DecoratorSet decorators>
+  struct PostRuntimeDispatch<GCBarrierType, BARRIER_LOAD, decorators>: public AllStatic {
+    template <typename T>
+    static T access_barrier(void* addr) {
+      return GCBarrierType::load_in_heap(reinterpret_cast<T*>(addr));
+    }
+
+    static oop oop_access_barrier(void* addr) {
+      typedef typename HeapOopType<decorators>::type OopType;
+      if (HasDecorator<decorators, IN_HEAP>::value) {
+        return GCBarrierType::oop_load_in_heap(reinterpret_cast<OopType*>(addr));
+      } else {
+        return GCBarrierType::oop_load_not_in_heap(reinterpret_cast<OopType*>(addr));
+      }
+    }
+  };
+```
+很明显，对于基本类型，`access_barrier` 会调用 `GCBarrierType::load_in_heap` 去实现。对于 OOP 的访问，根据访问位置的不同，`oop_access_barrier` 会调用 `GCBarrierType::oop_load_in_heap` 或者是 `GCBarrierType::oop_load_not_in_heap`。
+
+这样，Post-runtime dispatch 对于非 Raw Access 的访问，又根据基本类型访问、Java 堆上 OOP 访问以及 Java 堆外 OOP 访问分别派发了三种 access barrier。
+
+## GC Barrier
