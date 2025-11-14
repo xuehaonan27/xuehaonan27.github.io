@@ -5,12 +5,8 @@
 # 集群搭建过程
 ## 集群规划与机器创建
 本次部署计划部署一个master节点（由于仅需要一个测试环境，所以master同时作为管理节点、登录节点和数据传输节点）和四个compute节点。
-在[北京大学Clab云平台](https://clab.pku.edu.cn)上，创建一台master01机器，2c4g；创建4台compute0[1-4]机器，每一台机器4c8g；全部采用RockyLinux9.5镜像，分配在同一个校园网内网段（pku-new，IPv4 10.129.240.0/20）中。
 
-示例：
-![Clab机器](/images/2025-02-04-SlurmCluster/clab_machines.png)
-
-最终我们得到这些机器：
+我们有这些机器：
 10.129.244.164 master01
 10.129.244.75 compute01
 10.129.240.45 compute02

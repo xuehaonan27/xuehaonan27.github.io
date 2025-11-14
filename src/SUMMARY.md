@@ -17,6 +17,8 @@
   - [Try LFS on MacMini M4](./server_maintenance/try_lfs_on_macmini_m4.md)
 - [Managed Runtime](./managed_runtime/README.md)
   - [Debug G1 load barrier in C2 JIT](./managed_runtime/load-barrier-c2-debug.md)
+  - [OpenJDK 21 Hotspot JVM G1 GC](./managed_runtime/openjdk21-hotspot-jvm-g1gc.md)
+  - [Hotspot JVM OOP access](./managed_runtime/oop_access.md)
 - [Miscellaneous](./misc/README.md)
   - [Newbee](./misc/newbee.md)
 
