@@ -261,6 +261,13 @@ static void verify_primitive_decorators() {
 ## accessBackend.hpp
 该文件以及关联的 accessBackend.inline.hpp 以及 accessBackend.cpp 实现了 Step 1 - 4。
 
+先回忆一下 accessDecorators.hpp 中定义的 HasDecorator。
+```Cpp
+template <DecoratorSet decorators, DecoratorSet decorator>
+struct HasDecorator: public std::integral_constant<bool, (decorators & decorator) != 0> {};
+```
+它是一个元布尔值，传入 `DecoratorSet decorators` 和 `DecoratorSet decorator`，检查 `decorator` 是否在 `decorators` 中，并且将结果值存放在 value 中。
+
 ### HeapOopType
 ```Cpp
 // This metafunction returns either oop or narrowOop depending on whether
@@ -272,7 +279,7 @@ struct HeapOopType: AllStatic {
   using type = std::conditional_t<needs_oop_compress, narrowOop, oop>;
 };
 ```
-这是一个 metafunction，传入 `DecoratorSet decorators`，检查 decorators 中是否设置了`INTERNAL_CONVERT_COMPRESSED_OOP` 或者 `INTERNAL_RT_USE_COMPRESSED_OOPS`，静态地判断是否需要 oop compress，并且通过 `std::conditional_t` 将返回值结果放在 type 中。
+这是一个 metafunction，传入 `DecoratorSet decorators`，检查 decorators 中是否设置了`INTERNAL_CONVERT_COMPRESSED_OOP` 或者 `INTERNAL_RT_USE_COMPRESSED_OOPS`，静态地判断是否需要 oop compress，如果需要，那么对象指针应该是压缩过的 `narrowOop`，如果不需要那么应该是一般的 `oop` 类型，并且通过 `std::conditional_t` 将返回值结果放在 type 中。
 
 ### BarrierType
 ```Cpp
@@ -292,3 +299,312 @@ struct HeapOopType: AllStatic {
 一个枚举，表示 barrier 是针对什么 oop operation 的。
 
 ### MustConvertCompressedOop
+```Cpp
+  template <DecoratorSet decorators, typename T>
+  struct MustConvertCompressedOop: public std::integral_constant<bool,
+    HasDecorator<decorators, INTERNAL_VALUE_IS_OOP>::value &&
+    std::is_same<typename HeapOopType<decorators>::type, narrowOop>::value &&
+    std::is_same<T, oop>::value> {};
+```
+一个元布尔值，传入 `DecoratorSet decorators` 和 `typename T`，通过检查 `decorators` 中是否设置了 `INTERNAL_VALUE_IS_OOP`、`decorators` 所指示的 HeapOopType（见上）是否为 narrowOop、以及 `T` 是否为 oop 这三者来确定自身的值是 true 还是 false。注意到只有当本次 access 配置的装饰器集合指示本次 access 是针对 narrowOop 的访问，并且 access 要求的返回值类型是 `oop` 是，才要求 must convert compress oop。
+
+### EncodedType
+```Cpp
+// This metafunction returns an appropriate oop type if the value is oop-like
+  // and otherwise returns the same type T.
+  template <DecoratorSet decorators, typename T>
+  struct EncodedType: AllStatic {
+    using type = std::conditional_t<HasDecorator<decorators, INTERNAL_VALUE_IS_OOP>::value,
+                                    typename HeapOopType<decorators>::type,
+                                    T>;
+  };
+```
+这是一个元函数，传入参数 `DecoratorSet decorators` 和 `typename T`，检查本次 access 的装饰器集合中是否配置了 `INTERNAL_VALUE_IS_OOP`，即本次访问是否是针对 oop 的访问？如果是的话那么就用 `HeapOopType` 从 `decorators` 中确定 oop 类型；如果不是的话那么就返回 T（即应该是一个基本类型访问）。
+
+### oop_field_addr
+```Cpp
+template <DecoratorSet decorators>
+  inline typename HeapOopType<decorators>::type*
+  oop_field_addr(oop base, ptrdiff_t byte_offset) {
+    return reinterpret_cast<typename HeapOopType<decorators>::type*>(
+             reinterpret_cast<intptr_t>((void*)base) + byte_offset);
+  }
+```
+一个一般的 Cpp 函数，返回值类型通过 `HeapOopType` 从元参数 `DecoratorSet decorators` 中提取，作用应该是给那些带有 `_at` 后缀的 OOP operation 组合出实际上应当访问的地址。一个简单的指针偏移，没啥好说的。
+
+### PossiblyLockedAccess
+```Cpp
+// This metafunction returns whether it is possible for a type T to require
+  // locking to support wide atomics or not.
+  template <typename T>
+#ifdef SUPPORTS_NATIVE_CX8
+  struct PossiblyLockedAccess: public std::false_type {};
+#else
+  struct PossiblyLockedAccess: public std::integral_constant<bool, (sizeof(T) > 4)> {};
+#endif
+```
+一个元函数，对于位宽较大的类型，可能硬件不支持单指令原子操作，需要加 lock 然后进行宽原子操作。
+
+### AccessFunctionTypes
+```Cpp
+  template <DecoratorSet decorators, typename T>
+  struct AccessFunctionTypes {
+    typedef T (*load_at_func_t)(oop base, ptrdiff_t offset);
+    typedef void (*store_at_func_t)(oop base, ptrdiff_t offset, T value);
+    typedef T (*atomic_cmpxchg_at_func_t)(oop base, ptrdiff_t offset, T compare_value, T new_value);
+    typedef T (*atomic_xchg_at_func_t)(oop base, ptrdiff_t offset, T new_value);
+
+    typedef T (*load_func_t)(void* addr);
+    typedef void (*store_func_t)(void* addr, T value);
+    typedef T (*atomic_cmpxchg_func_t)(void* addr, T compare_value, T new_value);
+    typedef T (*atomic_xchg_func_t)(void* addr, T new_value);
+
+    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, T* src_raw,
+                                     arrayOop dst_obj, size_t dst_offset_in_bytes, T* dst_raw,
+                                     size_t length);
+    typedef void (*clone_func_t)(oop src, oop dst, size_t size);
+  };
+
+  template <DecoratorSet decorators>
+  struct AccessFunctionTypes<decorators, void> {
+    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, void* src,
+                                     arrayOop dst_obj, size_t dst_offset_in_bytes, void* dst,
+                                     size_t length);
+  };
+
+  template <DecoratorSet decorators>
+  struct AccessFunctionTypes<decorators, void> {
+    typedef bool (*arraycopy_func_t)(arrayOop src_obj, size_t src_offset_in_bytes, void* src,
+                                     arrayOop dst_obj, size_t dst_offset_in_bytes, void* dst,
+                                     size_t length);
+  };
+```
+这个类定义了各个 OOP operation 对应的函数类型。其中类的元参数中 `DecoratorSet decorators` 是本次访问的装饰器集合，`typename T` 是 OOP operation 的返回类型。
+
+### AccessFunction
+```Cpp
+  template <DecoratorSet decorators, typename T, BarrierType barrier> struct AccessFunction {};
+
+#define ACCESS_GENERATE_ACCESS_FUNCTION(bt, func)                   \
+  template <DecoratorSet decorators, typename T>                    \
+  struct AccessFunction<decorators, T, bt>: AllStatic{              \
+    typedef typename AccessFunctionTypes<decorators, T>::func type; \
+  }
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_STORE, store_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_STORE_AT, store_at_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_LOAD, load_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_LOAD_AT, load_at_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_CMPXCHG, atomic_cmpxchg_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_CMPXCHG_AT, atomic_cmpxchg_at_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_XCHG, atomic_xchg_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ATOMIC_XCHG_AT, atomic_xchg_at_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_ARRAYCOPY, arraycopy_func_t);
+  ACCESS_GENERATE_ACCESS_FUNCTION(BARRIER_CLONE, clone_func_t);
+#undef ACCESS_GENERATE_ACCESS_FUNCTION
+
+  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
+  typename AccessFunction<decorators, T, barrier_type>::type resolve_barrier();
+
+  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
+  typename AccessFunction<decorators, T, barrier_type>::type resolve_oop_barrier();
+```
+
+针对每一个 OOP operation 的函数类型，都声明一个 `template <DecoratorSet decorators, typename T> struct AccessFunction<decorators, T, bt>`。这个 `AccessFunction` 作为元函数主要是返回里存储的 `typename AccessFunctionTypes<decorators, T>::func type`， 即根据 barrier type 就能推导对应哪一个 access function type（OOP operatio 的函数签名）。
+
+```Cpp
+  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
+  typename AccessFunction<decorators, T, barrier_type>::type resolve_barrier();
+
+  template <DecoratorSet decorators, typename T, BarrierType barrier_type>
+  typename AccessFunction<decorators, T, barrier_type>::type resolve_oop_barrier();
+```
+所以这两个函数 `resolve_barrier` 和 `resolve_oop_barrier` 都是这样的，根据传入的装饰器集合、访问的值类型 T 以及对应屏障类型，解析出来应该使用的访问函数的函数签名（函数类型）是怎样的。
+
+### AccessLocker
+```Cpp
+  class AccessLocker {
+  public:
+    AccessLocker();
+    ~AccessLocker();
+  };
+  bool wide_atomic_needs_locking();
+```
+为位宽较大的类型模拟原子操作。
+
+### RawAccessBarrier
+这个类比较大，主要是执行 Raw Access 用的，里面的方法用于 Raw Access 派发。
+```Cpp
+// The RawAccessBarrier performs raw accesses with additional knowledge of
+// memory ordering, so that OrderAccess/Atomic is called when necessary.
+// It additionally handles compressed oops, and hence is not completely "raw"
+// strictly speaking.
+template <DecoratorSet decorators>
+class RawAccessBarrier: public AllStatic;
+```
+注意到注释提到，RawAccessBarrier 虽然声称是执行 RawAccess 的，但是其实还会考虑到内存序、oop压缩指针等。
+
+```Cpp
+// This mask specifies what decorators are relevant for raw accesses. When passing
+// accesses to the raw layer, irrelevant decorators are removed.
+const DecoratorSet RAW_DECORATOR_MASK = INTERNAL_DECORATOR_MASK | MO_DECORATOR_MASK |
+                                        ARRAYCOPY_DECORATOR_MASK | IS_NOT_NULL;
+```
+定义了 `RawAccessBarrier` 所关心的所有装饰器类型。
+
+#### field_addr
+```Cpp
+  static inline void* field_addr(oop base, ptrdiff_t byte_offset) {
+    return AccessInternal::field_addr(base, byte_offset);
+  }
+```
+代理一下之前见到的 `field_addr` 简单的计算一下地址。
+
+#### encode / decode
+```Cpp
+  // Only encode if INTERNAL_VALUE_IS_OOP
+  template <DecoratorSet idecorators, typename T>
+  static inline typename EnableIf<
+    AccessInternal::MustConvertCompressedOop<idecorators, T>::value,
+    typename HeapOopType<idecorators>::type>::type
+  encode_internal(T value);
+
+  template <DecoratorSet idecorators, typename T>
+  static inline typename EnableIf<
+    !AccessInternal::MustConvertCompressedOop<idecorators, T>::value, T>::type
+  encode_internal(T value) {
+    return value;
+  }
+
+  template <typename T>
+  static inline typename AccessInternal::EncodedType<decorators, T>::type
+  encode(T value) {
+    return encode_internal<decorators, T>(value);
+  }
+
+  // Only decode if INTERNAL_VALUE_IS_OOP
+  template <DecoratorSet idecorators, typename T>
+  static inline typename EnableIf<
+    AccessInternal::MustConvertCompressedOop<idecorators, T>::value, T>::type
+  decode_internal(typename HeapOopType<idecorators>::type value);
+
+  template <DecoratorSet idecorators, typename T>
+  static inline typename EnableIf<
+    !AccessInternal::MustConvertCompressedOop<idecorators, T>::value, T>::type
+  decode_internal(T value) {
+    return value;
+  }
+
+  template <typename T>
+  static inline T decode(typename AccessInternal::EncodedType<decorators, T>::type value) {
+    return decode_internal<decorators, T>(value);
+  }
+```
+
+注意到这些函数定义中使用的元参数 `DecoratorSet idecorators` 和 `RawAccessBarrier` 类型定义中的元参数 `DecoratorSet decorators` 是不一样的，即类成员函数的模板不绑定到类模板上。
+
+注意这里面使用了 SFINAE (Substitution Failure Is Not An Error)，其中 `EnableIf` 就是 `std::enable_if` 的别名。会利用前文所述的元布尔值 `MustConvertCompressedOop` 检查传入的 `idecorators` 是否需要进行 Oop 压缩指针转换到 `T`，并且指针转换目标类型由 `HeapOopType` 元函数计算得出，即第一个 `encode_internal` 会执行压缩指针相关的。而这个 `encode_internal` 的实现细节如下：
+```Cpp
+template <DecoratorSet decorators>
+template <DecoratorSet idecorators, typename T>
+inline typename EnableIf<
+  AccessInternal::MustConvertCompressedOop<idecorators, T>::value,
+  typename HeapOopType<idecorators>::type>::type
+RawAccessBarrier<decorators>::encode_internal(T value) {
+  if (HasDecorator<decorators, IS_NOT_NULL>::value) {
+    return CompressedOops::encode_not_null(value);
+  } else {
+    return CompressedOops::encode(value);
+  }
+}
+```
+注意到之前提到的 `IS_NOT_NULL` 装饰器在这里就发挥了作用：如果能够保证这个访问的 OOP 指针不是空指针，那么就可以调用开销较小的 `encode_not_null` 上了（少一次if，即 cmov 应该是）。
+
+
+而如果第一个 encode_internal 匹配失败，它就是 Failure 而不是 Error，会继续尝试匹配第二个 `encode_internal`，即如果 `MustConvertCompressedOop` 检查到 `idecorators` 指示的 OOP 类型到 `T` 不需要压缩指针转换，那么就会匹配到这个 `encode_internal` 上，由于 `idecorators` 指示的返回类型应该是和 `T` 一致的，所以直接原样返回即可，不需要额外的编码逻辑。
+
+而下方的 `encode` 函数则是对上方所有的 `encode_internal` 进行了封装，并且元参数和 `RawAccessBarrier` 保持一致了。这样，对基本类型、oop 类型和 narrowOop 类型的访问就统一使用了 `encode` 一个函数即可。
+
+下方 `decode` 同样逻辑。总结 encode / decode 封装了 `RawAccessBarrier` 对 OOP 指针压缩的操作，通过 SFINAE 在编译期静态派发到具体函数。
+
+#### load / store / atomic_cmpxchg / atomic_xchg
+和上文所述的 encode / decode 一样，如果说它们利用 SFINAE 实现并封装了 `RawAccessBarrier` 关于 OOP 指针压缩的操作，那么这部分就是利用 SFINAE 实现并封装了 `RawAccessBarrier` 关于原子和内存序的操作。
+
+以 load 操作举例分析，其他操作逻辑一样。
+```Cpp
+  template <typename T>
+  static inline T load(void* addr) {
+    return load_internal<decorators, T>(addr);
+  }
+
+  template <DecoratorSet ds, typename T>
+  static typename EnableIf<
+    HasDecorator<ds, MO_SEQ_CST>::value, T>::type
+  load_internal(void* addr);
+
+  template <DecoratorSet ds, typename T>
+  static typename EnableIf<
+    HasDecorator<ds, MO_ACQUIRE>::value, T>::type
+  load_internal(void* addr);
+
+  template <DecoratorSet ds, typename T>
+  static typename EnableIf<
+    HasDecorator<ds, MO_RELAXED>::value, T>::type
+  load_internal(void* addr);
+
+  template <DecoratorSet ds, typename T>
+  static inline typename EnableIf<
+    HasDecorator<ds, MO_UNORDERED>::value, T>::type
+  load_internal(void* addr) {
+    return *reinterpret_cast<T*>(addr);
+  }
+```
+
+`load` 继承 `RawAccessBarrier` 的 `DecoratorSet decorators`，并自己持有返回值类型 `T`。并且派发到四个 `load_internal` 之一。由于在静态已经 verify 过，内存序装饰器类别中有且只能有一个装饰器被设置，所以一定是可以唯一静态派发到其中一个 `load_internal` 的，即分别是 `MO_SEQCST`，`MO_ACQUIRE`，`MO_RELAXED` 和 `MO_UNORDERED` 语义的 load 操作上（load一般没有 release 语义，所以如果是 release load 的话 Failure 就会模板匹配失败成为 error，正好是符合预期的）。
+
+#### RawAccessBarrier oop operation
+`RawAccessBarrier` 对 OOP 的操作同时要考虑 OOP 指针压缩的问题，以及原子操作内存序的问题。将这二者结合，就成为了 `RawAccessBarrier` 中有关 oop 的一系列操作，它们是 `RawAccessBarrier` 类对外主要暴露的接口。
+
+```Cpp
+  template <typename T>
+  static void oop_store(void* addr, T value);
+  template <typename T>
+  static void oop_store_at(oop base, ptrdiff_t offset, T value);
+
+  template <typename T>
+  static T oop_load(void* addr);
+  template <typename T>
+  static T oop_load_at(oop base, ptrdiff_t offset);
+
+  template <typename T>
+  static T oop_atomic_cmpxchg(void* addr, T compare_value, T new_value);
+  template <typename T>
+  static T oop_atomic_cmpxchg_at(oop base, ptrdiff_t offset, T compare_value, T new_value);
+
+  template <typename T>
+  static T oop_atomic_xchg(void* addr, T new_value);
+  template <typename T>
+  static T oop_atomic_xchg_at(oop base, ptrdiff_t offset, T new_value);
+
+  template <typename T>
+  static bool oop_arraycopy(arrayOop src_obj, size_t src_offset_in_bytes, T* src_raw,
+                            arrayOop dst_obj, size_t dst_offset_in_bytes, T* dst_raw,
+                            size_t length);
+
+  static void clone(oop src, oop dst, size_t size);
+```
+
+以 `oop_load` 为例子。
+```Cpp
+template <DecoratorSet decorators>
+template <typename T>
+inline T RawAccessBarrier<decorators>::oop_load(void* addr) {
+  typedef typename AccessInternal::EncodedType<decorators, T>::type Encoded;
+  Encoded encoded = load<Encoded>(reinterpret_cast<Encoded*>(addr));
+  return decode<T>(encoded);
+}
+```
+首先通过 `EncodedType` 推导出本次 OOP access 的 OOP 类型是怎样的，即确定是 narrowOop 还是 oop。然后通过 `load` 操作从地址 `addr` 中原子地将这个 oop 指针（或者 32bit narrowOop 指针）拿出来，最后通过 `decode` 调用 `CompressedOops` 解码（如果 `Encoded` 是 `oop` 那么原样返回，如果是 `narrowOop` 那么经过一些计算得到 `oop`），最终返回出 `T` 这个类型（实际上就应该是 `oop` 类型）。
+
+### Access Pipeline
+这一部分具体介绍 Access 的流水线式派发。
+
