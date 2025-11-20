@@ -19,6 +19,7 @@
   - [Debug G1 load barrier in C2 JIT](./managed_runtime/load-barrier-c2-debug.md)
   - [OpenJDK 21 Hotspot JVM G1 GC](./managed_runtime/openjdk21-hotspot-jvm-g1gc.md)
   - [Hotspot JVM OOP access](./managed_runtime/oop_access.md)
+  - [Narrow OOP](./managed_runtime/narrow_oop_structure.md)
 - [Miscellaneous](./misc/README.md)
   - [Newbee](./misc/newbee.md)
 
