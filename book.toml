@@ -1,8 +1,0 @@
-[book]
-title = "xuehaonan27's blog"
-authors = ["Xue Haonan"]
-language = "en"
-
-[output.html]
-mathjax-support = true
-site-url = "/blog/"
